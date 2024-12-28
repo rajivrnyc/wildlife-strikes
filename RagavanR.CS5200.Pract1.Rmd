@@ -1,0 +1,580 @@
+---
+title: "Analysis of Wildlife Strikes in Commercial Aviation"
+subtitle: "Practicum 1 CS5200"
+author: "Rajiv Ragavan"
+email: "ragavan.r@northeastern.edu"
+date: "Fall 2024"
+output: html_document
+---
+
+## Loading of Packages
+```{r setup, eval = T, echo = F, message = F, warning = F}
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+install.packages("librarian")
+librarian::shelf(uuid, DBI, RMySQL, lubridate, kableExtra)
+```
+
+
+
+## Connection to the DB
+```{r connect to db, eval = T, echo=T, message=F, warning=F}
+
+# 1. Settings
+db_host_db4free <- "db4free.net"
+db_port_db4free <- 3306
+db_name_db4free <- "pract1rrr"
+db_user_db4free <- "rajivrny"
+db_pwd_db4free <- "PWHWBD8RJ6"
+
+# 2. Connect to remote server database
+mydb.db4free <-  dbConnect(RMySQL::MySQL(), 
+                         user = db_user_db4free, 
+                         password = db_pwd_db4free,
+                         dbname = db_name_db4free, 
+                         host = db_host_db4free, 
+                         port = db_port_db4free)
+```
+
+```{r cleardb, eval = T, echo = F, message=F, warning=F, results='hide'}
+# Essentially resets all created components added to the MySQL db
+dbExecute(mydb.db4free, "DROP TABLE IF EXISTS `wildlife.strikes`;")
+dbExecute(mydb.db4free, "DROP TABLE IF EXISTS  flights;")
+dbExecute(mydb.db4free, "DROP TABLE IF EXISTS `conditions`;")
+dbExecute(mydb.db4free, "DROP TABLE IF EXISTS `wildlife_sizes`;")
+dbExecute(mydb.db4free, "DROP TABLE IF EXISTS `airports`;")
+dbExecute(mydb.db4free, "DROP TABLE IF EXISTS `update_log`;")
+dbExecute(mydb.db4free, "DROP PROCEDURE IF EXISTS `update_wildlife_strike`;")
+```
+
+## Creating Table Schema
+```{r create database schema, eval =T, echo = T, message = F, warning = F, results='hide'}
+
+# Using VARCHAR for airports and flights to store synthetic UUIDs
+
+# Made VARCHAR(255) to avoid BLOB/TEXT errors
+
+# Using VARCHAR for airportCode as well because using a default value is not supported for type TEXT in db4free and all airportCodes are 3 letters so VARCHAR(3) is suitable.
+dbExecute(mydb.db4free, "
+    CREATE TABLE IF NOT EXISTS airports (
+      aid VARCHAR(36) PRIMARY KEY,
+      airportName VARCHAR(255),
+      airportState VARCHAR(255),
+      airportCode VARCHAR(3) DEFAULT 'ZZZ',
+      UNIQUE (airportName, airportState)
+     );")
+    
+dbExecute(mydb.db4free, "
+    CREATE TABLE IF NOT EXISTS flights (
+      fid VARCHAR(36) PRIMARY KEY,
+      date DATE,
+      originAirport VARCHAR(36),
+      airlineName TEXT,
+      aircraftType TEXT,
+      isHeavy BOOLEAN DEFAULT FALSE,
+      FOREIGN KEY (originAirport) REFERENCES airports(aid)
+      );")
+      
+dbExecute(mydb.db4free, "
+    CREATE TABLE IF NOT EXISTS `conditions` (
+      cid INTEGER AUTO_INCREMENT PRIMARY KEY,
+      sky_condition TEXT,
+      explanation TEXT
+      );")
+
+dbExecute(mydb.db4free, "
+    CREATE TABLE IF NOT EXISTS wildlife_sizes (
+      wid INTEGER AUTO_INCREMENT PRIMARY KEY,
+      sizes TEXT NOT NULL
+    );")
+      
+dbExecute(mydb.db4free, "
+    CREATE TABLE IF NOT EXISTS `wildlife.strikes` (
+      iid INTEGER PRIMARY KEY,
+      fid VARCHAR(36),
+      wlsize INTEGER,
+      `impact` TEXT,
+      altitude INTEGER CHECK (altitude >= 0),
+      `conditions` INTEGER,
+      FOREIGN KEY (fid) REFERENCES flights(fid),
+      FOREIGN KEY (conditions) REFERENCES conditions(cid),
+      FOREIGN KEY (wlsize) REFERENCES wildlife_sizes(wid)
+    );"
+
+);
+```
+
+
+```{r test table existence, eval =F, echo=F, message = F, warning = F}
+dbGetQuery(mydb.db4free, "SHOW COLUMNS FROM airports;")
+dbGetQuery(mydb.db4free, "SHOW COLUMNS FROM flights;")
+dbGetQuery(mydb.db4free, "SHOW COLUMNS FROM conditions;")
+dbGetQuery(mydb.db4free, "SHOW COLUMNS FROM `wildlife.strikes`;")
+dbGetQuery(mydb.db4free, "SHOW COLUMNS FROM wildlife_sizes;")
+```
+
+
+
+
+```{r load csv, eval = T, echo = F, message = F, warning = F}
+
+bds.raw <- read.csv("https://s3.us-east-2.amazonaws.com/artificium.us/datasets/BirdStrikesData-V4-SuF24.csv", stringsAsFactors = FALSE)
+
+```
+
+## Inserting Values into Lookup Tables
+```{r insert into lookup, eval =T, echo = T, message = F, warning = F, results='hide'}
+
+# Extract unique conditions from the data frame
+unique_conditions <- unique(bds.raw$sky_conditions)
+insert_conditions <- paste("INSERT IGNORE INTO `conditions` (sky_condition, explanation) VALUES",
+                          paste(sprintf("('%s', '')", unique_conditions), collapse = ", "),
+                          ";")
+dbExecute(mydb.db4free, insert_conditions)
+unique_sizes <- unique(bds.raw$wildlife_size)
+unique_sizes <- unique_sizes[unique_sizes != ""]
+insert_sizes <- paste("INSERT IGNORE INTO `wildlife_sizes` (sizes) VALUES",
+                          paste(sprintf("('%s')", unique_sizes), collapse = ", "),
+                          ";")
+dbExecute(mydb.db4free, insert_sizes)
+```
+
+## Populating Airports Table from Raw Data
+```{r load from bds.raw to airports, eval = T, echo = T, message = F, warning = F}
+
+# Deals with apostrophe quotes in strings within the df like "O'Hare"
+apostrophe_check <- function(string) {
+  gsub("'", "''", string)
+}
+
+# Defines values for string insertion
+create_airport_inserts <- function(r, bds.raw) {
+  uuid_value <- UUIDgenerate()
+  airport_name <- apostrophe_check(bds.raw$dep_airport[r])
+  state_name <- apostrophe_check(bds.raw$origin_state[r])
+  paste0("('", uuid_value, "', '", airport_name, "', '", state_name, "')")
+}
+
+
+n.airports <- nrow(bds.raw)
+batch_size <- 1000
+
+dbBegin(conn = mydb.db4free)
+
+#Make a loop so it does insert in batches
+for(start in seq(1, n.airports, by = batch_size)) {
+  end <- min (start + batch_size - 1, n.airports)
+  
+  # Use the named function to create the value strings
+    values <- sapply(start:end, function(r) create_airport_inserts(r, bds.raw))
+  
+  # Write SQL statement
+  sqlStmt <- paste0("INSERT IGNORE INTO airports (aid, airportName, airportState) VALUES ", 
+                      paste(values, collapse = ", "))
+  
+  #Execute SQL Statement
+  nr <- dbSendStatement(conn = mydb.db4free, statement = sqlStmt)
+  dbClearResult(nr)
+}
+
+#Commits changes made since begin all at once to save time
+dbCommit(conn=mydb.db4free)
+
+```
+
+
+## Populating Flights Table from Raw Data
+```{r load from bds.raw to flights, eval = T, echo = T, message = F, warning = F}
+bds.raw$fid <- UUIDgenerate(n = nrow(bds.raw))
+
+convert_date_time_to_date <- function(date_time_string) {
+ if (is.null(date_time_string) || is.na(date_time_string) || trimws(date_time_string) == "") {
+   return(NULL)
+ }
+  
+ date_time <- mdy_hm(date_time_string)
+ return (as.Date(date_time))
+}
+
+# This finds the origin airport id by matching common fields from bds.raw
+# that also exist in the airport data frame.
+airports_query <- "SELECT aid, airportName, airportState FROM airports"
+airports_df <- dbGetQuery(mydb.db4free, airports_query)
+
+get_origin_airport_aid <- function(dep_airport, origin_state, airports_df) {
+    matched_airport <- airports_df[apostrophe_check(airports_df$airportName) == apostrophe_check(dep_airport) & apostrophe_check(airports_df$airportState) == apostrophe_check(origin_state), ]
+    return(matched_airport$aid)
+}
+
+# Defines values for string insertion
+create_flight_inserts <- function(r, bds.raw) {
+  fid <- bds.raw$fid[r]
+  flight_date <- convert_date_time_to_date(bds.raw$flight_date[r])
+  origin_airport <- get_origin_airport_aid(bds.raw$dep_airport[r], bds.raw$origin_state[r], airports_df)
+  airline_name <- apostrophe_check(bds.raw$airline[r])
+  aircraft_type <- bds.raw$aircraft[r]
+  is_heavy <- ifelse(bds.raw$heavy_flag[r] == "Yes", TRUE, FALSE)
+  
+  # So I can record the null flight date values
+convert_flight_date <-function(flight_date)
+  if (is.null(flight_date)) {
+    flight_date_sql <- "NULL" 
+  } else {
+    return(paste0("'", flight_date, "'")) 
+  }
+flight_date_sql <- convert_flight_date(flight_date)
+  
+  paste0("('", fid, "', ", flight_date_sql, ", '", origin_airport, "', '", airline_name, "', '", aircraft_type, "', ", is_heavy, ")")
+}
+
+n.flights <- nrow(bds.raw)
+batch_size <- 5000
+
+dbBegin(conn = mydb.db4free)
+
+# Loop so insertions are done in batches
+for(start in seq(1, n.flights, by = batch_size)) {
+  end <- min(start + batch_size - 1, n.flights)
+  
+  values <- sapply(start:end, function(r) create_flight_inserts(r, bds.raw))
+  
+  #Write SQL Statement
+  sqlStmt <- paste0("INSERT INTO flights (fid, date, originAirport, airlineName, aircraftType, isHeavy) VALUES ", 
+                    paste(values, collapse = ", "))
+  
+  
+  nr <- dbSendStatement(conn = mydb.db4free, statement = sqlStmt)
+  dbClearResult(nr)
+}
+#Commit all the changes made
+dbCommit(conn = mydb.db4free)
+```
+
+## Populating Wildlife Strikes Table from Raw Data
+```{r load from bds.raw to `wildlife.strikes`, eval = T, echo = T, message = F, warning = F}
+
+
+# So I can record the null flight date values
+convert_flight_date <-function(flight_date) {
+  if (is.null(flight_date)) {
+    flight_date_sql <- "NULL" 
+  } else {
+    return(paste0("'", flight_date, "'")) 
+  }
+}
+# Function to determine the associated cid for each sky_condition
+sky_query <- "SELECT cid, sky_condition FROM `conditions`"
+sky_df <- dbGetQuery(mydb.db4free, sky_query)
+
+sky_conditions_check <- function(sky_condition, sky_df) {
+    matched_sky <- sky_df[(sky_df$sky_condition) == sky_condition, ]
+    return(matched_sky$cid)
+}
+
+# Function to determine the associated wid for each wildlife size
+wl_query <- "SELECT wid, sizes FROM wildlife_sizes"
+wl_df <- dbGetQuery(mydb.db4free, wl_query)
+
+wl_size_check <- function(wl_size, wl_df) {
+  matched_size <- wl_df[wl_size == wl_df$sizes, ]
+  if (nrow(matched_size) == 0){
+    return(NULL)
+  }
+    return(matched_size$wid)
+}
+
+# Found an issue where in rStudio the iid value when mapped to a dataframe was recorded
+# as ï..iid but on posit.cloud it was recorded as iid. This is to ensure consistency.
+if ("ï..iid" %in% colnames(bds.raw)) {
+  colnames(bds.raw)[which(colnames(bds.raw) == "ï..iid")] <- "iid"
+}
+
+# Defines values for string insertion
+create_strikes_inserts <- function(r, bds.raw) {
+  iid <- bds.raw$iid[r]
+  fid <- bds.raw$fid[r]
+  wlsize <- wl_size_check(bds.raw$wildlife_size[r], wl_df)
+  impact <- bds.raw$impact[r]
+  altitude <- gsub(",","",bds.raw$altitude_ft[r])
+  conditions <- sky_conditions_check(bds.raw$sky_conditions[r], sky_df)
+  
+  if (altitude == "" || is.na(altitude)) {
+    altitude <- "NULL"
+  }
+  wlsize_sql <- ifelse(is.null(wlsize), "NULL", paste0("'", wlsize, "'"))
+  
+  
+ paste0("('", iid, "', '", fid, "', ", wlsize_sql, ", '", impact, "', ", altitude, ", '", conditions, "')")
+}
+
+n.flights <- nrow(bds.raw)
+batch_size <- 5000
+
+dbBegin(conn = mydb.db4free)
+
+# Loop so insertions are done in batches
+for(start in seq(1, n.flights, by = batch_size)) {
+  end <- min(start + batch_size - 1, n.flights)
+  
+  values <- sapply(start:end, function(r) create_strikes_inserts(r, bds.raw))
+  
+  #Write SQL Statement
+  sqlStmt <- paste0("INSERT INTO `wildlife.strikes` (iid, fid, wlsize, impact, altitude, conditions) VALUES ", 
+                    paste(values, collapse = ", "))
+  
+  nr <- dbSendStatement(conn = mydb.db4free, statement = sqlStmt)
+  dbClearResult(nr)
+}
+#Commit all the changes made
+dbCommit(conn = mydb.db4free)
+```
+
+## Assigning Sentinel Values for Airport Name
+```{r assign sentinel values to blank airport names, eval = T, echo = T, message = F, warning = F}
+ #Updating Airport name for wherever the entry is NULL or empty
+dbExecute(mydb.db4free, "UPDATE airports
+SET airportName = 'unknown'
+WHERE airportName IS NULL OR airportName = '';")
+
+```
+
+
+## Assigning Sentinel Values for Airport State
+```{r assign sentinel values to blank airport state, eval = T, echo = T, message = F, warning = F}
+ #Updating Airport State for wherever the entry is N/A or empty
+dbExecute(mydb.db4free, "UPDATE airports
+SET airportState = 'unknown'
+WHERE airportState = 'N/A' OR airportState = '';")
+
+```
+
+
+```{r show_conditions, eval = F, echo = F, message = F, warning = F}
+# Show the first few rows of the conditions table
+conditions_query <- dbGetQuery(mydb.db4free, "SELECT * FROM `conditions` LIMIT 5;")
+print(conditions_query)
+```
+
+```{r show_wildlife_sizes, eval = F, echo = F, message = F, warning = F}
+# Show the first few rows of the wildlife_sizes table
+wildlife_sizes_query <- dbGetQuery(mydb.db4free, "SELECT * FROM `wildlife_sizes` LIMIT 5;")
+print(wildlife_sizes_query)
+```
+
+```{r show_wildlife_strikes, eval = F, echo = F, message = F, warning = F}
+# Show the first few rows of the wildlife.strikes table
+wildlife_strikes_query <- dbGetQuery(mydb.db4free, "SELECT * FROM `wildlife.strikes` LIMIT 5;")
+print(wildlife_strikes_query)
+```
+
+```{r show_flights, eval = F, echo = F, message = F, warning = F}
+# Show the first few rows of the flights table
+flights_query <- dbGetQuery(mydb.db4free, "SELECT * FROM `flights` LIMIT 5;")
+print(flights_query)
+```
+
+```{r show_airports, eval = F, echo = F, message = F, warning = F}
+# Show the first few rows of the airports table
+airports_query <- dbGetQuery(mydb.db4free, "SELECT * FROM `airports` LIMIT 5;")
+print(airports_query)
+```
+
+## Top States with Strikes
+
+```{r top_states_with_strikes, eval = T, echo = F, message = F, warning = F}
+
+# SQL query to find state with top 5 strike count
+query <- "
+  SELECT `airportState`, COUNT(*) AS `count_incidents`
+  FROM `wildlife.strikes` ws
+  JOIN flights f ON ws.fid = f.fid
+  JOIN airports a ON f.originAirport = a.aid
+  GROUP BY airportState
+  ORDER BY count_incidents DESC
+  LIMIT 5;"
+
+#Get the data
+top_states_with_strikes <- dbGetQuery(mydb.db4free, query)
+
+#Display data
+kable(top_states_with_strikes,
+      col.names = c("State", "Number of Strikes"),
+      caption = "Top 5 Steats with Wildlife Strike Incidents") %>%
+  kable_styling("striped", full_width = F)
+```
+
+## Analysis by Airport
+
+```{r analysis_by_airport, eval = T, echo = F, message = F, warning = F}
+# SQL Query to find airports with below average strikes
+# This selects the airports with the most incidents that are less than the average.
+# The first subquery find count of incidents grouped by airport
+# The second subquery finds the average incident count
+# The comparison makes it so that the selected airports are only the from the first subquery
+# that are less than the value from the second subquery
+query_airports <- " SELECT airportName, incident_count
+                    FROM (
+                        SELECT a.airportName, COUNT(*) AS incident_count
+                        FROM `wildlife.strikes` ws
+                        JOIN flights f ON f.fid = ws.fid
+                        JOIN airports a ON a.aid = f.originAirport
+                        GROUP BY a.airportName
+                    ) AS airport_incidents
+                    WHERE incident_count < (
+                      SELECT AVG(incident_count)
+                      FROM(
+                      SELECT COUNT(*) AS incident_count
+                      FROM `wildlife.strikes` ws
+                      JOIN flights f ON f.fid = ws.fid
+                      JOIN airports a ON f.originAirport = a.aid
+                      GROUP BY a.airportName
+                    ) AS avg_incidents
+                  )
+                  ORDER BY incident_count DESC  
+                  LIMIT 5;
+                  "
+
+#Get data
+below_avg_airport <- dbGetQuery(mydb.db4free, query_airports)
+
+#Display results
+kable(below_avg_airport,
+      col.names = c("Airport Name", "Number of Incidents"),
+      caption = "Airports with Below Average Number of Wildlife Strike Incidents") %>%
+  kable_styling("striped", full_width = F)
+  
+```
+
+## Analysis by Year
+
+```{r analysis_by_year, eval = T, echo = F, message = F, warning = F}
+# Using case when to easily identify each unique wz.size and then using SUM to find the total for each size
+year_query <- " SELECT YEAR(f.date) AS year, SUM(CASE WHEN wz.sizes =(SELECT DISTINCT sizes FROM wildlife_sizes LIMIT 1 OFFSET 1) THEN 1 ELSE 0 END) as small_strikes,
+                                             SUM(CASE WHEN wz.sizes =(SELECT DISTINCT sizes FROM wildlife_sizes LIMIT 1) THEN 1 ELSE 0 END) as medium_strikes,
+                                             SUM(CASE WHEN wz.sizes =(SELECT DISTINCT sizes FROM wildlife_sizes LIMIT 1 OFFSET 2) THEN 1 ELSE 0 END) as large_strikes
+                FROM `wildlife.strikes` ws
+                JOIN wildlife_sizes wz ON ws.wlsize = wz.wid
+                JOIN flights f ON ws.fid = f.fid
+                GROUP BY year
+                ORDER BY year;"
+
+yearly_wildlife_strikes <- dbGetQuery(mydb.db4free, year_query)
+
+kable(yearly_wildlife_strikes,
+      col.names = c("Year", "Small Strikes", "Medium Strikes", "Large Strikes"),
+      caption = "Total Wildlife Strikes Grouped by Size Each Year") %>%
+  kable_styling("striped", full_width = F)
+```
+
+## Trend by Year
+```{r trend_by_year, eval = T, echo = F, message = F, warning = F}
+xrange <- range(yearly_wildlife_strikes$year)
+yrange <- range(c(yearly_wildlife_strikes$small_strikes,
+                  yearly_wildlife_strikes$medium_strikes,
+                  yearly_wildlife_strikes$large_strikes))
+
+
+plot(xrange, yrange, type ="n", xlab = "Years", ylab="Strike Count")
+colors <- c("blue", "green", "red")
+linetypes <- c(1, 2, 3)
+plotchars <- c(1, 2, 3)
+
+# Defining each line
+lines(yearly_wildlife_strikes$year, yearly_wildlife_strikes$small_strikes, 
+      type="b", lwd=1.5, lty=linetypes[1], col=colors[1], pch=plotchars[1])
+lines(yearly_wildlife_strikes$year, yearly_wildlife_strikes$medium_strikes, 
+      type="b", lwd=1.5, lty=linetypes[2], col=colors[2], pch=plotchars[2])
+lines(yearly_wildlife_strikes$year, yearly_wildlife_strikes$large_strikes, 
+      type="b", lwd=1.5, lty=linetypes[3], col=colors[3], pch=plotchars[3])
+
+title("Trend by Year")
+
+# Creating a legend to easily identify lines
+legend("topleft",legend=c("Small Strikes", "Medium Strikes", "Large Strikes"), 
+       col=colors, pch=plotchars, lty=linetypes, cex=0.8, title="Strike Size")
+```
+
+## Creating Update Log Table and Update Procedure
+```{r create_update_log, eval = T, echo = F, message = F, warning = F}
+dbExecute(mydb.db4free, "CREATE TABLE IF NOT EXISTS update_log (
+                            update_id INTEGER AUTO_INCREMENT PRIMARY KEY,
+                            modification_type TEXT,
+                            table_name TEXT,
+                            time_of_update DATETIME,
+                            original_values TEXT);")
+
+# The inputs I will need to conduct the update procedure
+# Inserting the update log with all the existing values of the record that will be updated
+# Updating wildlife.strikes with the correct input values and using the iid passed in as an index
+sp <- paste0("CREATE PROCEDURE update_wildlife_strike (
+              IN strike_id INT,
+              IN new_wlsize INT,
+              IN new_impact TEXT,
+              IN new_altitude INT,
+              IN new_conditions INT)
+             
+             
+             BEGIN
+              INSERT INTO `update_log` (modification_type, table_name, time_of_update, original_values)
+              SELECT 'UPDATE', 'wildlife.strikes', NOW(), CONCAT('iid: ', iid,
+                                                                ', fid: ', fid,
+                                                                ', wlsize: ', wlsize,
+                                                                ', impact: ', impact,
+                                                                ', altitude: ', altitude,
+                                                                ', conditions: ', conditions)
+              FROM `wildlife.strikes`
+              WHERE iid = strike_id;
+              
+              
+              UPDATE `wildlife.strikes`
+              SET wlsize = new_wlsize,
+                  impact = new_impact,
+                  altitude = new_altitude,
+                  conditions = new_conditions
+              WHERE iid = strike_id;
+              
+              END
+              "
+             )
+rs = dbExecute(mydb.db4free, sp)
+```
+
+
+## Showing Record That Will Be Updated
+```{r record to be updated, eval = T, echo = F, message = F, warning = F}
+# Code to check the info on the record that will be updated
+to_update <- dbGetQuery(mydb.db4free, "SELECT * 
+                                       FROM `wildlife.strikes`
+                                       WHERE iid = 1195")
+print(to_update)
+```
+
+## Calling Stored Procedure
+```{r call update, eval = T, echo = F, message = F, warning = F}
+# Code to Call the update
+dbExecute(mydb.db4free, "CALL update_wildlife_strike(1195, 3, 'Precautionary Landing', 1000, 2)")
+```
+
+
+## Showing Record After Call
+```{r post update, eval = T, echo = F, message = F, warning = F}
+# Code to check wildlife.strikes after the update occurred to id 1195
+to_update <- dbGetQuery(mydb.db4free, "SELECT * 
+                                       FROM `wildlife.strikes`
+                                       WHERE iid = 1195")
+print(to_update)
+```
+
+
+## Showing Update Log After Call
+```{r update recorded, eval=T, echo=F, message=F, warning =F}
+# Code to check the log after the update has been entered
+update_log_check <- dbGetQuery(mydb.db4free, "SELECT * 
+                                       FROM `update_log`
+                                       ")
+print(update_log_check)
+```
+
+```{r disconnect from database, eval = T, echo = F, message = F, warning = F}
+#Disconnects from the database
+dbDisconnect(mydb.db4free)
+```
